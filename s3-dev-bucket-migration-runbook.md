@@ -13,16 +13,18 @@ Replicates S3 buckets **with data and KMS encryption** from the old account to t
 | `REGION` | `ap-south-1` |
 | `REPL_ROLE` (old account) | `s3-replication-role` |
 | `REPL_ROLE_ARN` | `arn:aws:iam::890290782969:role/s3-replication-role` |
-| `DEV_KEY_ARN` (new account) | `arn:aws:kms:ap-south-1:254265893962:key/c2f8d666-0ad4-4b38-8a69-4cbe3292dd5c` |
+| `DEV_KEY_ARN` (new account, shared default) | `arn:aws:kms:ap-south-1:254265893962:key/c2f8d666-0ad4-4b38-8a69-4cbe3292dd5c` |
 | `DEV_KEY_ALIAS` | `studio-dev-kms-key` |
 
 ### Per-bucket mapping (one row per bucket)
 
-| # | Source bucket (old) | Source KMS key ARN (old) | Destination bucket (new) | Status |
-|---|---|---|---|---|
-| 1 | `agenthub-dev-s3-bucket` | `arn:aws:kms:ap-south-1:890290782969:key/761a36b0-8ec0-4f17-8ed7-000ef2ddc599` | `studio-dev-project-bucket` | Done |
-| 2 | | | | |
-| 3 | | | | |
+Every source bucket can have its **own** KMS key in the old account. Record both the source key and the destination key for each bucket. The destination key can be the shared dev key for all buckets, or a separate key per project.
+
+| # | Source bucket (old) | Source KMS key ARN (old account) | Destination bucket (new) | Destination KMS key ARN (new account) | Status |
+|---|---|---|---|---|---|
+| 1 | `agenthub-dev-s3-bucket` | `arn:aws:kms:ap-south-1:890290782969:key/761a36b0-8ec0-4f17-8ed7-000ef2ddc599` | `studio-dev-project-bucket` | `arn:aws:kms:ap-south-1:254265893962:key/c2f8d666-0ad4-4b38-8a69-4cbe3292dd5c` | Done |
+| 2 | | | | | |
+| 3 | | | | | |
 
 Notes:
 - Bucket names are global, so every destination bucket needs a new unique name.
@@ -34,7 +36,13 @@ Notes:
 
 ## Part A: One-time setup (do once, reuse for all dev buckets)
 
-### A1. Create the dev KMS key (NEW account)
+### A1. Create the destination KMS key(s) (NEW account)
+
+Choose one approach:
+- **Shared dev key (simplest):** create one key (`studio-dev-kms-key`) and use it for every dev bucket.
+- **Key per project:** create one key per project (for example `agenthub-dev-kms-key`) to mirror the old setup and control access per project. Repeat A1 and A4 for **each** key, and add each key to the role policy (A3).
+
+Steps for each key:
 
 1. Switch to the **new account**, region `ap-south-1`.
 2. KMS → Customer managed keys → **Create key**.
@@ -103,16 +111,20 @@ Start with the first bucket. For every additional bucket, **add its resources** 
       ]
     },
     {
-      "Sid": "EncryptWithNewKey",
+      "Sid": "EncryptWithNewKeys",
       "Effect": "Allow",
       "Action": ["kms:Encrypt", "kms:GenerateDataKey"],
-      "Resource": "arn:aws:kms:ap-south-1:254265893962:key/c2f8d666-0ad4-4b38-8a69-4cbe3292dd5c"
+      "Resource": [
+        "arn:aws:kms:ap-south-1:254265893962:key/c2f8d666-0ad4-4b38-8a69-4cbe3292dd5c"
+      ]
     }
   ]
 }
 ```
 
 ### A4. Add the role to the new KMS key policy (NEW account)
+
+Do this on **every destination key** you created (one key if shared, one per project otherwise).
 
 KMS → the key → **Key policy → Edit**. Keep the default root statement and add the second one:
 
@@ -151,7 +163,7 @@ Do **not** remove the root statement or you can lock yourself out of the key.
 3. Object Ownership: ACLs disabled (bucket owner enforced).
 4. Block all public access: **on** (unless the old bucket served public content, then match the old setting).
 5. **Bucket Versioning: Enable** (required for replication).
-6. Default encryption: **SSE-KMS** → choose `studio-dev-kms-key` (or paste `DEV_KEY_ARN`). Bucket Key: **Enabled**.
+6. Default encryption: **SSE-KMS** → choose this bucket's **destination key** from the mapping table (the shared `studio-dev-kms-key`, or the project's own key). Bucket Key: **Enabled**.
 7. Copy tags if needed (for example `Environment=dev`, `Project=...`).
 8. Create bucket.
 
@@ -193,9 +205,13 @@ Source bucket → Properties → **Bucket Versioning must be Enabled**. Enable i
 
 ### B4. Allow the role to decrypt the source key (OLD account)
 
+Each source bucket can have a **different** KMS key. Do this for every bucket, using that bucket's own key.
+
 Only if the source bucket uses a customer-managed KMS key:
-- Add the source key ARN to the `DecryptWithOldKeys` statement of the role policy (A3).
-- The old key's policy must allow the role. The default key policy (root statement with `kms:*`) already delegates to IAM, so no change is needed. If the key policy has no root statement, add `kms:Decrypt` for the role.
+- Find the key: `aws s3api get-bucket-encryption --bucket <SRC> --profile old`, or S3 → bucket → Properties → Default encryption. Record it in the mapping table.
+- Add that source key ARN to the `DecryptWithOldKeys` statement of the role policy (A3).
+- The old key's policy must allow the role. The default key policy (root statement with `kms:*`) already delegates to IAM, so no change is needed. If the key policy is custom and has no root statement, add `kms:Decrypt` for `s3-replication-role` to that key's policy.
+- Objects can be encrypted with an **older key** than the bucket's current default. If the Batch job reports `AccessDenied` on KMS for some objects, check which key those objects use (object → Properties → Encryption) and add that key too.
 
 ### B5. Create the replication rule (OLD account)
 
@@ -212,7 +228,7 @@ Source bucket → **Management → Replication rules → Create replication rule
 | Change object ownership to destination bucket owner | **Tick** |
 | IAM role | **Choose from existing IAM roles → `s3-replication-role`** (do not choose "Create new role") |
 | Encryption | **Replicate** objects encrypted with AWS KMS |
-| Encryption key type | Tick **Specify destination key** → Enter KMS key ARN → `DEV_KEY_ARN` |
+| Encryption key type | Tick **Specify destination key** → Enter KMS key ARN → this bucket's **destination key ARN** from the mapping table (the replication rule uses the new-account key, never the old one) |
 | Replication metrics | Optional, recommended (progress and failure visibility) |
 | Delete marker replication | Off for a one-time migration |
 
@@ -235,11 +251,12 @@ A replication rule only copies **new** uploads. To copy existing data:
 
 ### B7. Update the replication IAM role for the new bucket (OLD account)
 
-Before running B6 for bucket #2 onward, add to the role policy (A3):
+Before running B5 and B6 for bucket #2 onward, add to the role policy (A3):
 - Source bucket ARN under `SourceBucketRead`
 - Source `/*` ARN under `SourceObjectRead`
 - Destination `/*` ARN under `DestinationWrite`
-- Source KMS key ARN under `DecryptWithOldKeys`
+- This bucket's source KMS key ARN under `DecryptWithOldKeys`
+- This bucket's destination KMS key ARN under `EncryptWithNewKeys` (skip if it is the shared key already listed)
 
 Do this before creating the rule and job.
 
@@ -286,12 +303,16 @@ Do this before creating the rule and job.
 ```
 Bucket: ______________  →  ______________
 
-[ ] B1  Destination bucket created (versioning ON, SSE-KMS with dev key, bucket key ON)
+Source KMS key (old):      ______________
+Destination KMS key (new): ______________
+
+[ ] A1/A4  Destination key exists and its key policy includes the replication role (skip if shared key already done)
+[ ] B1  Destination bucket created (versioning ON, SSE-KMS with its destination key, bucket key ON)
 [ ] B2  Destination bucket policy applied (name correct, includes ReplicateTags + OwnerOverride)
 [ ] B3  Source bucket versioning ON
-[ ] B4  Source KMS key ARN noted and decrypt access confirmed
-[ ] B7  Role policy updated with source, destination and source KMS key ARNs
-[ ] B5  Replication rule created (existing role, ownership change, KMS replicate with dev key ARN)
+[ ] B4  Source KMS key ARN noted, role can decrypt it (old key policy checked)
+[ ] B7  Role policy updated: source bucket, destination bucket, source KMS key, destination KMS key
+[ ] B5  Replication rule created (existing role, ownership change, KMS replicate with destination key ARN)
 [ ] B6  Batch Replication job run: succeeded = total, failed = 0
 [ ] B8  Verified: test upload, REPLICA status, new KMS key, counts match
 [ ] B9  Apps cut over, rule disabled, old bucket retained then removed
@@ -301,6 +322,6 @@ Bucket: ______________  →  ______________
 
 ## Notes
 
-- Dev buckets can share **one** dev KMS key and **one** replication role. Create a separate key (and ideally a separate role) for prod.
+- Dev buckets can share **one** replication role. Source buckets keep their own (different) old keys. For the destination, use one shared dev key or a key per project. Create separate keys (and ideally a separate role) for prod.
 - Optional speed-up: for small buckets, `aws s3 sync s3://<SRC> s3://<DEST>` run with credentials that can read the old bucket and write to the new one, avoids the replication setup entirely. Objects are re-encrypted with the destination bucket default.
 - Not every bucket needs data migrated. Logs, flow logs, CloudTrail, Config, CUR, `cf-templates-*` and tfstate buckets can usually be recreated empty in the new account.
