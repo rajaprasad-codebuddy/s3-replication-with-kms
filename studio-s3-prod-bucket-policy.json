@@ -1,0 +1,47 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "AllowCloudFrontServicePrincipal",
+            "Effect": "Allow",
+            "Principal": {
+                "Service": "cloudfront.amazonaws.com"
+            },
+            "Action": "s3:GetObject",
+            "Resource": "arn:aws:s3:::agenthub-prod-s3-bucket/*",
+            "Condition": {
+                "StringEquals": {
+                    "AWS:SourceArn": "arn:aws:cloudfront::890290782969:distribution/E3026HHDF2K1WA"
+                }
+            }
+        },
+        {
+            "Sid": "DenyAccessOutsideAppVPC",
+            "Effect": "Deny",
+            "Principal": "*",
+            "Action": "s3:*",
+            "Resource": [
+                "arn:aws:s3:::agenthub-prod-s3-bucket",
+                "arn:aws:s3:::agenthub-prod-s3-bucket/*"
+            ],
+            "Condition": {
+                "StringNotLike": {
+                    "aws:userid": [
+                        "AROA46SLXIL4TVG746D27:*",
+                        "AROA46SLXIL46QKZ7WC7T:*"
+                    ],
+                    "aws:SourceVpc": "vpc-0081fc004d8e62fad",
+                    "aws:PrincipalArn": [
+                        "arn:aws:iam::890290782969:user/raja-cdbd-devops",
+                        "arn:aws:iam::890290782969:user/agenthub-prod-project-user",
+                        "arn:aws:iam::890290782969:role/s3-replication-role-studio-prod", # replication IAM Role
+                        "arn:aws:iam::890290782969:role/*S3BatchOperations-REPLICATE_491e09" # Replication Job Role
+                    ]
+                },
+                "BoolIfExists": {
+                    "aws:PrincipalIsAWSService": "false"
+                }
+            }
+        }
+    ]
+}
